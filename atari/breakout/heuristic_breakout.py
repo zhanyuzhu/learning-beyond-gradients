@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -43,6 +44,7 @@ import numpy as np
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_LOG_PATH = SCRIPT_DIR / "heuristic_breakout_trials.jsonl"
 DEFAULT_SUMMARY_PATH = SCRIPT_DIR / "heuristic_breakout_trials_summary.csv"
+ALE_FPS = 60.0
 
 
 @dataclass(frozen=True)
@@ -893,8 +895,9 @@ def evaluate_heuristic_policy(args: argparse.Namespace) -> None:
     """Run the Breakout policy and append one trial record."""
     import envpool
 
-    env = envpool.make_gym(
-        "Breakout-v5",
+    # A single env instance, rendered in envpool's "human" mode (an
+    # opencv window) and paced to real wall-clock speed below.
+    env_kwargs: dict[str, Any] = dict(
         num_envs=1,
         batch_size=1,
         seed=args.seed,
@@ -911,6 +914,13 @@ def evaluate_heuristic_policy(args: argparse.Namespace) -> None:
         repeat_action_probability=0.0,
         full_action_space=False,
     )
+    if args.render:
+        env_kwargs["render_mode"] = "human"
+    env = envpool.make_gym("Breakout-v5", **env_kwargs)
+
+    # One env.step() advances `frame_skip` ALE frames, each 1/60s of
+    # real time, so pace every step to that duration for real-time playback.
+    step_period_s = args.frame_skip / ALE_FPS if args.realtime else 0.0
 
     config = HeuristicConfig(
         paddle_deadband_px=args.deadband,
@@ -938,27 +948,41 @@ def evaluate_heuristic_policy(args: argparse.Namespace) -> None:
     env_steps = 0
     episodes_started = 0
 
-    for episode in range(args.episodes):
-        obs, info = reset_env_with_info(env)
-        agent.reset()
-        episodes_started += 1
-        total_reward = 0.0
-        episode_steps = 0
-        for _ in range(args.max_steps):
-            action = agent.act(info if args.policy == "ram" else obs)
-            obs, reward, done, info = step_env(env, action)
-            agent.observe_reward(reward)
-            total_reward += reward
-            episode_steps += 1
-            env_steps += 1
-            if done:
-                break
-        scores.append(total_reward)
-        episode_lengths.append(episode_steps)
-        print(
-            f"episode={episode} score={total_reward:.1f} "
-            f"steps={episode_steps}"
-        )
+    try:
+        for episode in range(args.episodes):
+            obs, info = reset_env_with_info(env)
+            agent.reset()
+            episodes_started += 1
+            total_reward = 0.0
+            episode_steps = 0
+            if args.render:
+                env.render()
+            for _ in range(args.max_steps):
+                step_start = time.perf_counter()
+                action = agent.act(info if args.policy == "ram" else obs)
+                obs, reward, done, info = step_env(env, action)
+                agent.observe_reward(reward)
+                total_reward += reward
+                episode_steps += 1
+                env_steps += 1
+                if args.render:
+                    env.render()
+                if step_period_s > 0.0:
+                    remaining = step_period_s - (
+                        time.perf_counter() - step_start
+                    )
+                    if remaining > 0.0:
+                        time.sleep(remaining)
+                if done:
+                    break
+            scores.append(total_reward)
+            episode_lengths.append(episode_steps)
+            print(
+                f"episode={episode} score={total_reward:.1f} "
+                f"steps={episode_steps}"
+            )
+    finally:
+        env.close()
 
     score_arr = np.asarray(scores, dtype=np.float32)
     print(
@@ -1046,6 +1070,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--frame-skip", type=int, default=1)
     parser.add_argument("--noop-max", type=int, default=1)
+    parser.add_argument(
+        "--render",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Show the game in an opencv 'human' render window.",
+    )
+    parser.add_argument(
+        "--realtime",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Pace playback to real wall-clock speed "
+            "(60/frame_skip steps per second). Disable for fast eval runs."
+        ),
+    )
     parser.add_argument("--disable-fire-reset", action="store_true")
     parser.add_argument("--deadband", type=float, default=3.0)
     parser.add_argument("--chase-lead-steps", type=float, default=6.0)
