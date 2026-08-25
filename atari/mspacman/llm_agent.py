@@ -1,13 +1,34 @@
-"""A slow, tool-calling LLM supervisor for `policy.MsPacmanAgent`.
+"""A slow, tool-calling LLM strategy supervisor for `policy.MsPacmanAgent`.
 
-This does not touch `policy.py`. It watches the game at a fixed cadence and on
-key events, and may call `adjust_policy` to retune `HeuristicConfig` live, or
-`log_observation` to record a failure-mode note for later analysis - never a
-raw action. Every call runs in a background thread via a single-worker
-`ThreadPoolExecutor` so the 60 fps env loop never blocks on network I/O; the
-loop only ever polls a future, it never waits on one.
+This does not touch `policy.py`.  It watches the game on a fixed *step*
+cadence and on key events, and may call `set_strategy` to change the
+planner's standing posture, or `log_observation` to record a failure-mode
+note.  It never emits a raw action.  Every call runs in a background thread
+via a single-worker `ThreadPoolExecutor`, so the env loop never blocks on
+network I/O; the loop only ever polls a future.
 
-Requires `openai` and `Pillow` (only when `--agent` is passed):
+What this layer is *for*, and what it must stay away from, follows from one
+measurement: over 53 logged invocations against this endpoint the mean
+round trip was 11.3s, worst case 46s.  At `frame_skip=4` a realtime episode
+runs 15 env steps per second, so a reply lands about 170 steps after the
+frame it was looking at, while a power-pill window lasts roughly 90 steps.
+Any tactical instruction - "the ghosts are blue, chase them" - therefore
+arrives *after* the window it was meant for, and worse, the matching "they
+are lethal again, back off" arrives late too, leaving the planner at its
+most reckless setting exactly while the ghosts are dangerous.  The previous
+version of this file did precisely that, flapping between a `balanced` and
+an `aggressive_hunt` preset on the `pill_activated` event.
+
+So the division of labour is:
+
+* the Dijkstra planner owns everything that changes faster than ~10s -
+  ghost avoidance, chasing blue ghosts, routing.  It already reads
+  edibility every single frame, at zero latency;
+* the supervisor owns only postures that stay valid for tens of seconds -
+  how much risk to take on the last life, and whether to bait power pills
+  or race to clear the board.
+
+Requires `openai` and `Pillow` (only when `--agent` is passed)::
 
     pip install openai Pillow
 """
@@ -57,38 +78,57 @@ def load_dashscope_config(env_path: Path) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 # Strategy presets and safe parameter ranges
 #
-# Only a small, allow-listed subset of HeuristicConfig fields are tunable
-# from the LLM side - the ones that trade survival margin against scoring
-# aggression - and every value is clamped before it ever reaches agent.config.
+# Every preset is anchored on the settings `policy.py` was actually
+# validated with (mean 11044 over 60 sticky-action episodes); the modes
+# differ from that anchor by small, single-purpose deltas.  The old
+# `aggressive_hunt` preset cut `safety_margin` from 18 to 10 - a third of
+# the planner's whole safety buffer - and it was chosen in 13 of 21 logged
+# changes: a tuned config perturbed hard, in the wrong direction, on stale
+# information.
+#
+# `bait_enabled` is not a `HeuristicConfig` field but an attribute of
+# `BaitingAgent`; `policy_with_agent.py` routes it accordingly.
 # ---------------------------------------------------------------------------
 
 PRESET_MODES: dict[str, dict[str, float]] = {
+    # the validated defaults, with pill baiting on
     "balanced": {
-        "safety_margin": 18, "ghost_value": 200.0,
-        "pill_lure_radius": 80, "flash_chase_radius": 60, "hysteresis": 1.25,
+        "safety_margin": 18, "ghost_value": 200.0, "pill_lure_radius": 80,
+        "flash_chase_radius": 60, "hysteresis": 1.25, "bait_enabled": 1,
     },
-    "cautious": {
-        "safety_margin": 28, "ghost_value": 180.0,
-        "pill_lure_radius": 60, "flash_chase_radius": 40, "hysteresis": 1.6,
+    # survival first: wider berth, and never loiter beside a pill
+    "careful": {
+        "safety_margin": 26, "ghost_value": 180.0, "pill_lure_radius": 70,
+        "flash_chase_radius": 45, "hysteresis": 1.40, "bait_enabled": 0,
     },
-    "aggressive_hunt": {
-        "safety_margin": 10, "ghost_value": 320.0,
-        "pill_lure_radius": 100, "flash_chase_radius": 90, "hysteresis": 1.1,
+    # a nearly-empty board is worth finishing; stop waiting for ghosts
+    "clear_board": {
+        "safety_margin": 18, "ghost_value": 200.0, "pill_lure_radius": 80,
+        "flash_chase_radius": 60, "hysteresis": 1.25, "bait_enabled": 0,
     },
-    "pellet_rush": {
-        "safety_margin": 14, "ghost_value": 200.0,
-        "pill_lure_radius": 70, "flash_chase_radius": 60, "hysteresis": 1.15,
+    # plenty of board left and lives in hand: work the pills harder
+    "farm_ghosts": {
+        "safety_margin": 16, "ghost_value": 240.0, "pill_lure_radius": 95,
+        "flash_chase_radius": 70, "hysteresis": 1.20, "bait_enabled": 1,
     },
 }
 
-# name -> (min, max, cast)
+BASELINE_MODE = "balanced"
+
+# name -> (min, max, cast).  The ranges are deliberately narrow: they
+# bracket the validated defaults rather than spanning everything the
+# planner will accept, so no single call can undo the tuning.
 PARAM_RANGES: dict[str, tuple[float, float, type]] = {
-    "safety_margin": (0, 60, int),
-    "ghost_value": (50.0, 600.0, float),
-    "pill_lure_radius": (20, 160, int),
-    "flash_chase_radius": (20, 160, int),
-    "hysteresis": (1.0, 3.0, float),
+    "safety_margin": (12, 30, int),
+    "ghost_value": (120.0, 320.0, float),
+    "pill_lure_radius": (50, 110, int),
+    "flash_chase_radius": (30, 90, int),
+    "hysteresis": (1.05, 1.80, float),
+    "bait_enabled": (0, 1, int),
 }
+
+# keys that live on the agent rather than on HeuristicConfig
+AGENT_ATTRS = frozenset({"bait_enabled"})
 
 
 def _clamp(key: str, value: Any) -> float | int:
@@ -97,8 +137,9 @@ def _clamp(key: str, value: Any) -> float | int:
     return round(clamped) if cast is int else clamped
 
 
-def resolve_patch(mode: str, overrides: dict[str, Any] | None) -> dict[str, float | int]:
-    """Combine a preset with allow-listed overrides, all clamped to safe ranges."""
+def resolve_patch(mode: str, overrides: dict[str, Any] | None
+                  ) -> dict[str, float | int]:
+    """Combine a preset with allow-listed overrides, all clamped."""
     patch = dict(PRESET_MODES[mode])
     patch.update({key: value for key, value in (overrides or {}).items()
                   if key in PARAM_RANGES})
@@ -113,12 +154,18 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "adjust_policy",
+            "name": "set_strategy",
             "description": (
-                "修改这个基于规则的 Ms. Pac-Man 策略的实时调参。"
-                "只有在当前参数明显失效（反复死亡、被幽灵围堵、卡住不吃豆），"
-                "或出现明确的战术机会（例如附近的能量豆即将可用，且周围有多个幽灵）"
-                "时才调用。不要每一轮都调用——只在你确实想改变行为时才调用。"
+                "为规则规划器设定一个**长时程**的策略姿态。\n"
+                "只在你希望接下来几十秒都保持的取向发生变化时调用，例如：\n"
+                "只剩最后一条命了要保守、这一关豆子快吃完了应该直接清关、\n"
+                "或者命还很多且豆子还多、应该多花时间围绕能量豆钓幽灵。\n\n"
+                "**不要**用它做战术反应。你的回复平均要 11 秒才会生效\n"
+                "（约 170 个环境步），而一次能量豆的可食窗口只有约 90 步——\n"
+                "所以“现在幽灵变蓝了，去追”这类指令一定会迟到；\n"
+                "更糟的是随后那句“幽灵恢复危险了，快撤”同样会迟到，\n"
+                "反而让规划器在最危险的时刻停留在最激进的参数上。\n"
+                "幽灵的躲避与追捕由规划器每一帧自行处理，零延迟，无需你插手。"
             ),
             "parameters": {
                 "type": "object",
@@ -126,21 +173,28 @@ TOOLS = [
                     "mode": {
                         "type": "string",
                         "enum": list(PRESET_MODES),
-                        "description": "作为基线应用的粗粒度策略预设。",
+                        "description": (
+                            "balanced=已验证的默认姿态（含能量豆诱敌）；\n"
+                            "careful=保命优先，不再守在能量豆旁；\n"
+                            "clear_board=残局，直接把豆子吃完；\n"
+                            "farm_ghosts=命多豆多时，加大围绕能量豆钓幽灵的力度。"
+                        ),
                     },
                     "overrides": {
                         "type": "object",
-                        "description": "在预设之上的可选微调。",
+                        "description": "在预设之上的小幅微调，均会被裁剪到安全区间。",
                         "properties": {
                             "safety_margin": {"type": "integer"},
                             "ghost_value": {"type": "number"},
                             "pill_lure_radius": {"type": "integer"},
                             "flash_chase_radius": {"type": "integer"},
                             "hysteresis": {"type": "number"},
+                            "bait_enabled": {"type": "integer"},
                         },
                         "additionalProperties": False,
                     },
-                    "reason": {"type": "string", "description": "简要说明这次调整的理由。"},
+                    "reason": {"type": "string",
+                               "description": "简要说明这次调整的理由。"},
                 },
                 "required": ["mode", "reason"],
             },
@@ -151,10 +205,10 @@ TOOLS = [
         "function": {
             "name": "log_observation",
             "description": (
-                "记录一条关于失败模式或值得注意的现象的诊断说明——死亡原因、"
-                "卡住/来回震荡的循环、看起来被误读的迷宫格子、错过的得分机会——"
-                "这不会改变游戏行为。只要你发现值得开发者事后排查的现象就调用它，"
-                "与你是否同时调用 adjust_policy 无关。"
+                "记录一条关于失败模式或值得注意现象的诊断说明——死亡原因、\n"
+                "卡住/来回震荡的循环、看起来被误读的迷宫格子、错过的得分机会——\n"
+                "这不会改变游戏行为。只要你发现值得开发者事后排查的现象就调用它，\n"
+                "与你是否同时调用 set_strategy 无关。"
             ),
             "parameters": {
                 "type": "object",
@@ -172,16 +226,31 @@ TOOLS = [
     },
 ]
 
-SYSTEM_PROMPT = """你是一个基于规则的 Ms. Pac-Man 智能体的策略主管。
+SYSTEM_PROMPT = (
+    "你是一个基于规则的 Ms. Pac-Man 智能体的**长时程**策略主管。\n\n"
 
-底层策略是一个基于 Dijkstra 的迷宫路径规划器，它每一帧都在运行；而你只会被偶尔调用\
-（按固定间隔，或在关键事件发生时），每次能看到一帧游戏画面，以及一份描述当前游戏状态\
-和规划器调参的 JSON 快照。你不能直接操控 Ms. Pac-Man——你只能通过 `adjust_policy`\
- 重新调整规划器的参数，或者通过 `log_observation` 留下一条诊断记录。请调用合适的工具；\
-只有当你确实想改变策略时才调用 `adjust_policy`，不要每一轮都调用。当你看到死亡、\
-卡住/来回震荡的行为，或任何看起来像是迷宫识别 bug 的现象时，请调用 `log_observation`\
- 把它记录下来以便事后复查——即使你在同一轮里也调用了 `adjust_policy`。\
-`reason` 和 `note` 一律用中文书写，简明扼要，一到两句话说清楚即可。"""
+    "底层是一个基于 Dijkstra 的迷宫路径规划器，它每一帧都在跑，\n"
+    "已经独立调优到 60 局平均约 11000 分。它每一帧都能看到幽灵是否可食、\n"
+    "是否在闪烁，并据此自行躲避和追捕——这部分**不需要也不应该由你干预**。\n\n"
+
+    "你被调用的频率很低（按固定步数间隔，或在关键事件时），\n"
+    "每次看到一帧画面和一份 JSON 快照。关键约束：\n"
+    "**你的回复平均要约 11 秒、即约 170 个环境步之后才会生效**，\n"
+    "快照里的 `decision_lag_steps` 会告诉你上一次的实际滞后。\n"
+    "而一次能量豆的可食窗口只有约 90 步。所以任何“此刻幽灵变蓝了、\n"
+    "快去追”式的战术指令必然迟到，并且有害。\n\n"
+
+    "你真正该管的是那些能维持几十秒的取向，例如：\n"
+    "只剩一条命时是否该更保守；这一关豆子只剩十几颗时是否该放弃钓幽灵、\n"
+    "直接清关；开局命多豆多时是否该更用力地围绕能量豆钓幽灵。\n\n"
+
+    "快照里带有反馈：`last_change` 会告诉你上一次调整之后的实际得分速率\n"
+    "和死亡数，`guardrail` 会告诉你系统是否因为效果变差而自动回退到了\n"
+    "默认参数。请利用这些证据，不要凭画面印象反复改来改去；\n"
+    "**如果没有明确理由要改变长时程取向，就不要调用 `set_strategy`**。\n"
+    "发现死亡、卡住、迷宫识别异常等现象时，用 `log_observation` 记录下来\n"
+    "以便事后复查。`reason` 和 `note` 一律用中文，一到两句话说清楚即可。"
+)
 
 
 def encode_frame_png_b64(frame: np.ndarray, scale: int = 3) -> str:
@@ -198,7 +267,8 @@ def build_messages(snapshot: dict[str, Any], image_b64: str) -> list[dict[str, A
         {
             "role": "user",
             "content": [
-                {"type": "text", "text": json.dumps(snapshot, sort_keys=True)},
+                {"type": "text",
+                 "text": json.dumps(snapshot, sort_keys=True, ensure_ascii=False)},
                 {"type": "image_url",
                  "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
             ],
@@ -206,33 +276,24 @@ def build_messages(snapshot: dict[str, Any], image_b64: str) -> list[dict[str, A
     ]
 
 
-def build_snapshot(state, agent, step: int, score: float, mode: str,
-                   trigger_reason: str | None,
-                   recent_notes: list[dict[str, str]]) -> dict[str, Any]:
-    return {
-        "step": step,
-        "score": score,
-        "lives": state.lives,
-        "dots_eaten": state.dots_eaten,
-        "ghosts_edible": state.edible,
-        "ghosts_flashing": state.flashing,
-        "trigger_reason": trigger_reason,
-        "current_mode": mode,
-        "current_config": {key: getattr(agent.config, key) for key in PARAM_RANGES},
-        "recent_notes": recent_notes,
-    }
-
-
 # ---------------------------------------------------------------------------
 # Event detection (external to policy.py, driven off its public state)
 # ---------------------------------------------------------------------------
 
-STAGNATION_STEPS = 180  # ~3s of wall clock at frame_skip=4, 60fps
+STAGNATION_STEPS = 180
 PANIC_STREAK_TRIGGER = 3
 
 
 class EventTracker:
-    """Watches `GameState`/`MsPacmanAgent` for moments worth an early invoke."""
+    """Watches `GameState`/`MsPacmanAgent` for moments worth an early invoke.
+
+    `pill_activated` is deliberately *not* a trigger any more.  It was the
+    one that produced the old flap - the reply it solicited could not
+    arrive inside the pill window it was reacting to - and the planner
+    needs no help there in any case.  What remains are events whose
+    consequences outlive the round trip: a death, a new level, and being
+    pinned or stalled.
+    """
 
     def __init__(self) -> None:
         self.reset()
@@ -240,12 +301,10 @@ class EventTracker:
     def reset(self) -> None:
         self.prev_lives: int | None = None
         self.prev_dots_eaten = 0
-        self.prev_edible_any = False
         self.panic_streak = 0
         self.last_progress_step = 0
 
     def update(self, step: int, state, agent) -> str | None:
-        edible_any = any(state.edible)
         self.panic_streak = self.panic_streak + 1 if agent.target is None else 0
         progressed = state.dots_eaten != self.prev_dots_eaten
         if progressed:
@@ -255,8 +314,6 @@ class EventTracker:
             reason = "death"
         elif state.dots_eaten < self.prev_dots_eaten - 5:
             reason = "level_start"
-        elif edible_any and not self.prev_edible_any:
-            reason = "pill_activated"
         elif self.panic_streak == PANIC_STREAK_TRIGGER:
             reason = "cornered_repeatedly"
         elif not progressed and step - self.last_progress_step >= STAGNATION_STEPS:
@@ -267,7 +324,6 @@ class EventTracker:
 
         self.prev_lives = state.lives
         self.prev_dots_eaten = state.dots_eaten
-        self.prev_edible_any = edible_any
         return reason
 
 
@@ -286,6 +342,8 @@ class InvocationResult:
     notes: list[dict[str, str]] = field(default_factory=list)
     raw_tool_calls: list[dict[str, Any]] = field(default_factory=list)
     error: str | None = None
+    submitted_step: int = -1
+    lag_steps: int = -1
 
 
 def read_tool_calls(tool_calls) -> dict[str, Any]:
@@ -300,11 +358,13 @@ def read_tool_calls(tool_calls) -> dict[str, Any]:
         except json.JSONDecodeError:
             continue  # one malformed call must not sink the whole turn
         raw.append({"name": call.function.name, "arguments": args})
-        if call.function.name == "adjust_policy":
-            mode = args.get("mode")
-            patch = resolve_patch(mode, args.get("overrides"))
-            notes.append({"category": "strategy_change",
-                          "note": args.get("reason", "")})
+        if call.function.name == "set_strategy":
+            candidate = args.get("mode")
+            if candidate in PRESET_MODES:
+                mode = candidate
+                patch = resolve_patch(mode, args.get("overrides"))
+                notes.append({"category": "strategy_change",
+                              "note": args.get("reason", "")})
         elif call.function.name == "log_observation":
             notes.append({"category": args.get("category", "other"),
                           "note": args.get("note", "")})
@@ -317,42 +377,48 @@ class AgentSupervisor:
 
     `maybe_invoke` and `poll` are both meant to be called once per env tick
     from the main thread; neither ever blocks on the network.
+
+    The cadence is counted in **env steps**, not wall-clock seconds.  Under
+    a seconds-based gate the identical code consults the model perhaps
+    twice in a headless episode and dozens of times in a `--realtime` one,
+    so the policy being measured is not the policy being demonstrated.
     """
 
     def __init__(self, model: str, base_url: str, api_key: str,
-                 log_path: Path, interval_s: float = 5.0,
-                 min_interval_s: float = 2.0, timeout_s: float = 15.0) -> None:
+                 log_path: Path, interval_steps: int = 150,
+                 min_interval_steps: int = 60, timeout_s: float = 20.0) -> None:
         self._client = OpenAI(api_key=api_key, base_url=base_url)
         self._model = model
         self._executor = ThreadPoolExecutor(max_workers=1)
         self._pending: Future | None = None
-        self._last_submit = float("-inf")
-        self._interval_s = interval_s
-        self._min_interval_s = min_interval_s
+        self._last_submit_step = -(1 << 30)
+        self._interval_steps = interval_steps
+        self._min_interval_steps = min_interval_steps
         self._timeout_s = timeout_s
         self._log_path = Path(log_path)
         self._log_path.parent.mkdir(parents=True, exist_ok=True)
 
     def maybe_invoke(self, frame: np.ndarray, snapshot: dict[str, Any],
-                     trigger_reason: str | None) -> None:
+                     trigger_reason: str | None, step: int) -> None:
         if self._pending is not None and not self._pending.done():
             return  # a call is already in flight; never queue a second one
         # an event may shorten the wait between calls, never lengthen it
-        gate = (min(self._interval_s, self._min_interval_s)
-                if trigger_reason else self._interval_s)
-        now = time.monotonic()
-        if now - self._last_submit < gate:
+        gate = (min(self._interval_steps, self._min_interval_steps)
+                if trigger_reason else self._interval_steps)
+        if step - self._last_submit_step < gate:
             return
         image_b64 = encode_frame_png_b64(frame)
-        self._last_submit = now
+        self._last_submit_step = step
         self._pending = self._executor.submit(
-            self._invoke_once, image_b64, snapshot, trigger_reason or "interval")
+            self._invoke_once, image_b64, snapshot,
+            trigger_reason or "interval", step)
 
-    def poll(self) -> InvocationResult | None:
+    def poll(self, step: int) -> InvocationResult | None:
         if self._pending is None or not self._pending.done():
             return None
         result: InvocationResult = self._pending.result()  # worker never raises
         self._pending = None
+        result.lag_steps = step - result.submitted_step
         self._append_log(result)
         return result
 
@@ -362,7 +428,7 @@ class AgentSupervisor:
     # -- worker thread body -------------------------------------------------
 
     def _invoke_once(self, image_b64: str, snapshot: dict[str, Any],
-                     trigger_reason: str) -> InvocationResult:
+                     trigger_reason: str, step: int) -> InvocationResult:
         started = time.monotonic()
         try:
             response = self._client.chat.completions.create(
@@ -373,12 +439,13 @@ class AgentSupervisor:
             fields = read_tool_calls(response.choices[0].message.tool_calls)
         except Exception as exc:  # network/timeout/malformed response, etc.
             return InvocationResult(trigger_reason, time.monotonic() - started,
-                                    ok=False, error=repr(exc))
+                                    ok=False, error=repr(exc),
+                                    submitted_step=step)
         return InvocationResult(trigger_reason, time.monotonic() - started,
-                                ok=True, **fields)
+                                ok=True, submitted_step=step, **fields)
 
     def _append_log(self, result: InvocationResult) -> None:
         record = {"timestamp": datetime.now().isoformat(timespec="seconds"),
                   **asdict(result)}
         with self._log_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record, sort_keys=True) + "\n")
+            f.write(json.dumps(record, sort_keys=True, ensure_ascii=False) + "\n")
