@@ -1,15 +1,16 @@
 """Runs `policy.MsPacmanAgent` with an optional async LLM strategy supervisor.
 
 `policy.py` is imported, never modified: this script reuses its envpool
-setup, the rule-based agent, and its trial-logging helpers verbatim, and adds
-an `--agent` flag that layers `llm_agent.AgentSupervisor` on top. The env
-still steps at a fixed cadence every tick; the supervisor only ever tunes
-`agent.config` between ticks from a background thread's already-finished
-result, so a slow or stalled DashScope call can never delay a step.
+setup, the rule-based agent, and its trial-logging helpers verbatim, and
+layers `llm_agent.AgentSupervisor` on top by default (pass `--no-agent` for
+the bare rule-based policy). The env still steps at a fixed cadence every
+tick; the supervisor only ever tunes `agent.config` between ticks from a
+background thread's already-finished result, so a slow or stalled DashScope
+call can never delay a step.
 
 Run it with::
 
-    python policy_with_agent.py --episodes 1 --render --realtime --agent
+    python policy_with_agent.py --episodes 1 --render --realtime
 """
 
 from __future__ import annotations
@@ -107,8 +108,12 @@ class Supervision:
 
 def build_agent_parser() -> argparse.ArgumentParser:
     parser = policy.build_parser()
-    parser.add_argument("--agent", action="store_true",
-                        help="enable the async LLM strategy supervisor")
+    parser.add_argument("--agent", dest="agent", action="store_true",
+                        default=True,
+                        help="enable the async LLM strategy supervisor (default)")
+    parser.add_argument("--no-agent", dest="agent", action="store_false",
+                        help="run the rule-based policy alone, without the "
+                             "LLM supervisor")
     parser.add_argument("--agent-interval-s", type=float, default=5.0,
                         help="fixed cadence between supervisor invocations")
     parser.add_argument("--agent-min-interval-s", type=float, default=2.0,
