@@ -115,13 +115,10 @@ TOOLS = [
         "function": {
             "name": "adjust_policy",
             "description": (
-                "Change the rule-based Ms. Pac-Man policy's live tuning "
-                "parameters. Use this only when the current settings are "
-                "clearly failing (repeated deaths, getting cornered, stuck "
-                "not eating pellets) or a clear strategic opportunity is "
-                "opening up (e.g. a power pill about to be usable near "
-                "several ghosts). Do not call this every turn - only when "
-                "you want to actually change behaviour."
+                "修改这个基于规则的 Ms. Pac-Man 策略的实时调参。"
+                "只有在当前参数明显失效（反复死亡、被幽灵围堵、卡住不吃豆），"
+                "或出现明确的战术机会（例如附近的能量豆即将可用，且周围有多个幽灵）"
+                "时才调用。不要每一轮都调用——只在你确实想改变行为时才调用。"
             ),
             "parameters": {
                 "type": "object",
@@ -129,11 +126,11 @@ TOOLS = [
                     "mode": {
                         "type": "string",
                         "enum": list(PRESET_MODES),
-                        "description": "Coarse strategy preset to apply as a base.",
+                        "description": "作为基线应用的粗粒度策略预设。",
                     },
                     "overrides": {
                         "type": "object",
-                        "description": "Optional fine-tuning on top of the preset.",
+                        "description": "在预设之上的可选微调。",
                         "properties": {
                             "safety_margin": {"type": "integer"},
                             "ghost_value": {"type": "number"},
@@ -143,7 +140,7 @@ TOOLS = [
                         },
                         "additionalProperties": False,
                     },
-                    "reason": {"type": "string", "description": "Why this change, briefly."},
+                    "reason": {"type": "string", "description": "简要说明这次调整的理由。"},
                 },
                 "required": ["mode", "reason"],
             },
@@ -154,12 +151,10 @@ TOOLS = [
         "function": {
             "name": "log_observation",
             "description": (
-                "Record a diagnostic note about a failure mode or notable "
-                "pattern you observed - a death cause, a stuck/oscillating "
-                "loop, a maze cell that looks misread, a missed scoring "
-                "opportunity - without changing gameplay. Call this whenever "
-                "you notice something worth a developer investigating later, "
-                "independently of whether you also call adjust_policy."
+                "记录一条关于失败模式或值得注意的现象的诊断说明——死亡原因、"
+                "卡住/来回震荡的循环、看起来被误读的迷宫格子、错过的得分机会——"
+                "这不会改变游戏行为。只要你发现值得开发者事后排查的现象就调用它，"
+                "与你是否同时调用 adjust_policy 无关。"
             ),
             "parameters": {
                 "type": "object",
@@ -177,18 +172,16 @@ TOOLS = [
     },
 ]
 
-SYSTEM_PROMPT = """You are the strategic supervisor for a rule-based Ms. Pac-Man agent.
+SYSTEM_PROMPT = """你是一个基于规则的 Ms. Pac-Man 智能体的策略主管。
 
-The low-level policy is a Dijkstra-based maze planner that already runs every \
-frame; you are invoked only occasionally (on a timer or on notable events) and \
-see one frame plus a JSON snapshot of the game and the planner's current \
-tuning. You cannot move Ms. Pac-Man directly - you can only retune the \
-planner's parameters via `adjust_policy`, or leave a diagnostic note via \
-`log_observation`. Call the tool that fits; call `adjust_policy` only when \
-you want to actually change strategy, not on every turn. When you see a \
-death, a stuck/oscillating pattern, or anything that looks like a bug in the \
-maze reading, call `log_observation` so it can be reviewed later, even if you \
-also call `adjust_policy` in the same turn."""
+底层策略是一个基于 Dijkstra 的迷宫路径规划器，它每一帧都在运行；而你只会被偶尔调用\
+（按固定间隔，或在关键事件发生时），每次能看到一帧游戏画面，以及一份描述当前游戏状态\
+和规划器调参的 JSON 快照。你不能直接操控 Ms. Pac-Man——你只能通过 `adjust_policy`\
+ 重新调整规划器的参数，或者通过 `log_observation` 留下一条诊断记录。请调用合适的工具；\
+只有当你确实想改变策略时才调用 `adjust_policy`，不要每一轮都调用。当你看到死亡、\
+卡住/来回震荡的行为，或任何看起来像是迷宫识别 bug 的现象时，请调用 `log_observation`\
+ 把它记录下来以便事后复查——即使你在同一轮里也调用了 `adjust_policy`。\
+`reason` 和 `note` 一律用中文书写，简明扼要，一到两句话说清楚即可。"""
 
 
 def encode_frame_png_b64(frame: np.ndarray, scale: int = 3) -> str:

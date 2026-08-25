@@ -34,17 +34,20 @@ MAX_RECENT_NOTES = 5
 
 
 def _print_result(step: int, result) -> None:
-    """Mirror every supervisor invocation to stdout, not just the JSONL log."""
+    """Mirror every supervisor invocation to stdout, not just the JSONL log.
+
+    The model's analysis first, then what it did to the policy.
+    """
     if not result.ok:
-        print(f"[agent] step={step} trigger={result.trigger} ERROR: {result.error}",
+        print(f"[policy] step={step} trigger={result.trigger} ERROR: {result.error}",
               flush=True)
         return
+    for note in result.notes:
+        print(note.get("note"), flush=True)
     change = (f" mode={result.mode} patch={result.config_patch}"
               if result.mode else " (no policy change)")
-    print(f"[agent] step={step} trigger={result.trigger} "
+    print(f"[policy] step={step} trigger={result.trigger} "
           f"latency={result.latency_s:.2f}s{change}", flush=True)
-    for note in result.notes:
-        print(f"  [agent:{note.get('category')}] {note.get('note')}", flush=True)
 
 
 class Supervision:
