@@ -33,33 +33,25 @@ from PIL import Image
 # simple KEY=VALUE lines)
 # ---------------------------------------------------------------------------
 
+ENV_KEYS = {"model": "DASHSCOPE_MODEL_NAME",
+            "base_url": "DASHSCOPE_BASE_URL",
+            "api_key": "DASHSCOPE_API_KEY"}
 
-def parse_env_file(path: Path) -> dict[str, str]:
+
+def load_dashscope_config(env_path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
-    if not path.exists():
-        return values
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in env_path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, value = line.partition("=")
-        values[key.strip()] = value.strip().strip('"').strip("'")
-    return values
+        values[key.strip()] = value.strip().strip("\"'")
 
-
-def load_dashscope_config(env_path: Path) -> dict[str, str]:
-    values = parse_env_file(env_path)
-    model = values.get("DASHSCOPE_MODEL_NAME")
-    base_url = values.get("DASHSCOPE_BASE_URL")
-    api_key = values.get("DASHSCOPE_API_KEY")
-    missing = [name for name, value in (
-        ("DASHSCOPE_MODEL_NAME", model),
-        ("DASHSCOPE_BASE_URL", base_url),
-        ("DASHSCOPE_API_KEY", api_key),
-    ) if not value]
+    config = {name: values.get(env_key, "") for name, env_key in ENV_KEYS.items()}
+    missing = [ENV_KEYS[name] for name, value in config.items() if not value]
     if missing:
         raise RuntimeError(f"Missing {', '.join(missing)} in {env_path}")
-    return {"model": model, "base_url": base_url, "api_key": api_key}
+    return config
 
 
 # ---------------------------------------------------------------------------
@@ -102,18 +94,14 @@ PARAM_RANGES: dict[str, tuple[float, float, type]] = {
 def _clamp(key: str, value: Any) -> float | int:
     lo, hi, cast = PARAM_RANGES[key]
     clamped = max(lo, min(hi, float(value)))
-    return int(round(clamped)) if cast is int else float(clamped)
+    return round(clamped) if cast is int else clamped
 
 
 def resolve_patch(mode: str, overrides: dict[str, Any] | None) -> dict[str, float | int]:
     """Combine a preset with allow-listed overrides, all clamped to safe ranges."""
-    if mode not in PRESET_MODES:
-        raise ValueError(f"unknown mode {mode!r}")
     patch = dict(PRESET_MODES[mode])
-    if overrides:
-        for key, value in overrides.items():
-            if key in PARAM_RANGES:
-                patch[key] = value
+    patch.update({key: value for key, value in (overrides or {}).items()
+                  if key in PARAM_RANGES})
     return {key: _clamp(key, value) for key, value in patch.items()}
 
 
@@ -204,9 +192,8 @@ also call `adjust_policy` in the same turn."""
 
 
 def encode_frame_png_b64(frame: np.ndarray, scale: int = 3) -> str:
-    img = Image.fromarray(np.ascontiguousarray(frame).astype(np.uint8), mode="RGB")
-    if scale != 1:
-        img = img.resize((img.width * scale, img.height * scale), Image.NEAREST)
+    img = Image.fromarray(np.ascontiguousarray(frame, dtype=np.uint8), mode="RGB")
+    img = img.resize((img.width * scale, img.height * scale), Image.NEAREST)
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode("ascii")
@@ -227,9 +214,8 @@ def build_messages(snapshot: dict[str, Any], image_b64: str) -> list[dict[str, A
 
 
 def build_snapshot(state, agent, step: int, score: float, mode: str,
-                    trigger_reason: str | None,
-                    recent_notes: list[dict[str, str]]) -> dict[str, Any]:
-    cfg = agent.config
+                   trigger_reason: str | None,
+                   recent_notes: list[dict[str, str]]) -> dict[str, Any]:
     return {
         "step": step,
         "score": score,
@@ -239,13 +225,7 @@ def build_snapshot(state, agent, step: int, score: float, mode: str,
         "ghosts_flashing": state.flashing,
         "trigger_reason": trigger_reason,
         "current_mode": mode,
-        "current_config": {
-            "safety_margin": cfg.safety_margin,
-            "ghost_value": cfg.ghost_value,
-            "pill_lure_radius": cfg.pill_lure_radius,
-            "flash_chase_radius": cfg.flash_chase_radius,
-            "hysteresis": cfg.hysteresis,
-        },
+        "current_config": {key: getattr(agent.config, key) for key in PARAM_RANGES},
         "recent_notes": recent_notes,
     }
 
@@ -272,25 +252,25 @@ class EventTracker:
         self.last_progress_step = 0
 
     def update(self, step: int, state, agent) -> str | None:
-        reason = None
+        edible_any = any(state.edible)
+        self.panic_streak = self.panic_streak + 1 if agent.target is None else 0
+        progressed = state.dots_eaten != self.prev_dots_eaten
+        if progressed:
+            self.last_progress_step = step
+
         if self.prev_lives is not None and state.lives < self.prev_lives:
             reason = "death"
         elif state.dots_eaten < self.prev_dots_eaten - 5:
             reason = "level_start"
-
-        edible_any = any(state.edible)
-        if reason is None and edible_any and not self.prev_edible_any:
+        elif edible_any and not self.prev_edible_any:
             reason = "pill_activated"
-
-        self.panic_streak = self.panic_streak + 1 if agent.target is None else 0
-        if reason is None and self.panic_streak == PANIC_STREAK_TRIGGER:
+        elif self.panic_streak == PANIC_STREAK_TRIGGER:
             reason = "cornered_repeatedly"
-
-        if state.dots_eaten != self.prev_dots_eaten:
-            self.last_progress_step = step
-        elif reason is None and step - self.last_progress_step >= STAGNATION_STEPS:
+        elif not progressed and step - self.last_progress_step >= STAGNATION_STEPS:
             reason = "stagnant"
             self.last_progress_step = step  # don't re-fire every tick
+        else:
+            reason = None
 
         self.prev_lives = state.lives
         self.prev_dots_eaten = state.dots_eaten
@@ -315,6 +295,30 @@ class InvocationResult:
     error: str | None = None
 
 
+def read_tool_calls(tool_calls) -> dict[str, Any]:
+    """Fold the model's tool calls into `InvocationResult` fields."""
+    mode: str | None = None
+    patch: dict[str, float | int] | None = None
+    notes: list[dict[str, str]] = []
+    raw: list[dict[str, Any]] = []
+    for call in tool_calls or []:
+        try:
+            args = json.loads(call.function.arguments or "{}")
+        except json.JSONDecodeError:
+            continue  # one malformed call must not sink the whole turn
+        raw.append({"name": call.function.name, "arguments": args})
+        if call.function.name == "adjust_policy":
+            mode = args.get("mode")
+            patch = resolve_patch(mode, args.get("overrides"))
+            notes.append({"category": "strategy_change",
+                          "note": args.get("reason", "")})
+        elif call.function.name == "log_observation":
+            notes.append({"category": args.get("category", "other"),
+                          "note": args.get("note", "")})
+    return {"mode": mode, "config_patch": patch,
+            "notes": notes, "raw_tool_calls": raw}
+
+
 class AgentSupervisor:
     """Owns the DashScope client and the single background worker slot.
 
@@ -334,16 +338,17 @@ class AgentSupervisor:
         self._min_interval_s = min_interval_s
         self._timeout_s = timeout_s
         self._log_path = Path(log_path)
+        self._log_path.parent.mkdir(parents=True, exist_ok=True)
 
     def maybe_invoke(self, frame: np.ndarray, snapshot: dict[str, Any],
-                      trigger_reason: str | None) -> None:
+                     trigger_reason: str | None) -> None:
         if self._pending is not None and not self._pending.done():
             return  # a call is already in flight; never queue a second one
+        # an event may shorten the wait between calls, never lengthen it
+        gate = (min(self._interval_s, self._min_interval_s)
+                if trigger_reason else self._interval_s)
         now = time.monotonic()
-        due_by_interval = (now - self._last_submit) >= self._interval_s
-        due_by_event = (trigger_reason is not None
-                         and (now - self._last_submit) >= self._min_interval_s)
-        if not (due_by_interval or due_by_event):
+        if now - self._last_submit < gate:
             return
         image_b64 = encode_frame_png_b64(frame)
         self._last_submit = now
@@ -353,8 +358,8 @@ class AgentSupervisor:
     def poll(self) -> InvocationResult | None:
         if self._pending is None or not self._pending.done():
             return None
-        future, self._pending = self._pending, None
-        result: InvocationResult = future.result()  # worker never raises
+        result: InvocationResult = self._pending.result()  # worker never raises
+        self._pending = None
         self._append_log(result)
         return result
 
@@ -364,42 +369,23 @@ class AgentSupervisor:
     # -- worker thread body -------------------------------------------------
 
     def _invoke_once(self, image_b64: str, snapshot: dict[str, Any],
-                      trigger_reason: str) -> InvocationResult:
+                     trigger_reason: str) -> InvocationResult:
         started = time.monotonic()
         try:
-            messages = build_messages(snapshot, image_b64)
             response = self._client.chat.completions.create(
-                model=self._model, messages=messages, tools=TOOLS,
-                tool_choice="auto", timeout=self._timeout_s,
+                model=self._model,
+                messages=build_messages(snapshot, image_b64),
+                tools=TOOLS, tool_choice="auto", timeout=self._timeout_s,
             )
-            message = response.choices[0].message
-            mode, patch, notes, raw = None, None, [], []
-            for call in message.tool_calls or []:
-                try:
-                    args = json.loads(call.function.arguments or "{}")
-                except json.JSONDecodeError:
-                    continue
-                raw.append({"name": call.function.name, "arguments": args})
-                if call.function.name == "adjust_policy":
-                    mode = args.get("mode")
-                    patch = resolve_patch(mode, args.get("overrides"))
-                    notes.append({"category": "strategy_change",
-                                  "note": args.get("reason", "")})
-                elif call.function.name == "log_observation":
-                    notes.append({"category": args.get("category", "other"),
-                                  "note": args.get("note", "")})
-            return InvocationResult(
-                trigger=trigger_reason, latency_s=time.monotonic() - started,
-                ok=True, mode=mode, config_patch=patch, notes=notes,
-                raw_tool_calls=raw)
+            fields = read_tool_calls(response.choices[0].message.tool_calls)
         except Exception as exc:  # network/timeout/malformed response, etc.
-            return InvocationResult(
-                trigger=trigger_reason, latency_s=time.monotonic() - started,
-                ok=False, error=repr(exc))
+            return InvocationResult(trigger_reason, time.monotonic() - started,
+                                    ok=False, error=repr(exc))
+        return InvocationResult(trigger_reason, time.monotonic() - started,
+                                ok=True, **fields)
 
     def _append_log(self, result: InvocationResult) -> None:
         record = {"timestamp": datetime.now().isoformat(timespec="seconds"),
                   **asdict(result)}
-        self._log_path.parent.mkdir(parents=True, exist_ok=True)
         with self._log_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, sort_keys=True) + "\n")
