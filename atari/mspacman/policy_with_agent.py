@@ -2,7 +2,7 @@
 
 `policy.py` is imported and never modified: this script reuses its envpool
 setup, its rule-based agent and its trial logging verbatim.  On top of that
-it adds two things, in order of how much they are worth.
+it adds three things, in order of how much they are worth.
 
 **1. Baiting power pills (`BaitingAgent`).**  Measured over 120 baseline
 episodes, a power pill is worth 3000 points if all four ghosts are eaten on
@@ -17,10 +17,20 @@ and the mechanism shows up where it should: 2.30 ghosts per pill and +1686
 points a game from ghosts, against -593 from the board-clearing it costs.
 
 Simply devaluing pills, chasing one committed ghost per phase, and leading
-the target were all tried and all lost to the baseline; see the module
-docstring in `llm_agent.py` for the supervisor side of the same story.
+the target were all tried and all lost to the baseline.
 
-**2. The supervisor (`llm_agent.AgentSupervisor`), rewired.**  It now runs
+**2. Not vibrating when cornered (`_panic_move`).**  Tracing every death in
+an episode found the same picture each time: `panic=True`, no target, and
+Ms. Pac-Man alternating between two cells for twenty-odd steps while the
+nearest ghost closed from eight cells away to zero.  The inherited panic
+move picks whichever neighbour is furthest from a ghost with no memory of
+the last choice, and stepping out of a cell shifts the threat field enough
+to make the cell just vacated the new best one.  Charging a small cost to
+double back is worth +1209 points over 150 episodes (2.4 combined SEM,
+positive on all three seed blocks tried).  Deaths do not change; what
+changes is how much board gets covered.
+
+**3. The supervisor (`llm_agent.AgentSupervisor`), rewired.**  It now runs
 on a step cadence rather than a wall-clock one, so a headless evaluation
 and a `--realtime` demo consult the model at the same points in the game;
 it is told what it may not do (tactics - the round trip is longer than a
@@ -107,14 +117,26 @@ class BaitingAgent(policy.MsPacmanAgent):
                  bait_radius: int = 70,
                  bait_hold_value: float = 6.0,
                  bait_pellet_bonus: float = 9.0,
-                 bait_pellet_radius: int = 3) -> None:
+                 bait_pellet_radius: int = 3,
+                 panic_commit: bool = True,
+                 panic_reverse_cost: int = 6,
+                 panic_hold_bonus: int = 3,
+                 panic_keep_last_move: bool = False) -> None:
         self.bait_enabled = bait_enabled
         self.bait_min_ghosts = bait_min_ghosts
         self.bait_radius = bait_radius
         self.bait_hold_value = bait_hold_value
         self.bait_pellet_bonus = bait_pellet_bonus
         self.bait_pellet_radius = bait_pellet_radius
+        self.panic_commit = panic_commit
+        self.panic_reverse_cost = panic_reverse_cost
+        self.panic_hold_bonus = panic_hold_bonus
+        self.panic_keep_last_move = panic_keep_last_move
         super().__init__(config)
+
+    def reset(self) -> None:
+        super().reset()
+        self._panic_dir: tuple[int, int] | None = None
 
     def _ghosts_near(self, state: policy.GameState, r: int, c: int) -> int:
         """Dangerous ghosts within `bait_radius` of a cell, in RAM units."""
@@ -147,6 +169,77 @@ class BaitingAgent(policy.MsPacmanAgent):
                     score += self.bait_pellet_bonus / (my_dist[cell] / scale + 1.0)
             rebuilt.append((score, cell))
         return rebuilt
+
+    # -- panic ------------------------------------------------------------
+
+    def _rank_moves(self, here, candidates, first):
+        ranked = super()._rank_moves(here, candidates, first)
+        if ranked:
+            self._panic_dir = None  # planning worked; forget the escape
+        return ranked
+
+    def _panic_move(self, here, ghost_dist):
+        """Cornered: run, and keep running the same way.
+
+        The inherited version takes whichever neighbour is furthest from a
+        ghost, with no memory of the last choice and no penalty for
+        doubling back.  Stepping out of a cell shifts the whole threat
+        field, which routinely makes the cell just vacated the new best
+        one - so she reverses, which makes the previous cell best again,
+        and she vibrates between two squares until a ghost arrives.
+
+        Tracing four deaths in one episode found this in every one of
+        them: deaths 3 and 4 spent all 22 steps before capture in panic,
+        alternating between two cells while the nearest ghost closed from
+        eight cells away to zero.  Panic covers 7-73% of steps depending on
+        the episode, and the worst episodes are the panicky ones.
+
+        Two changes: doubling back costs `panic_reverse_cost`, and holding
+        the direction already being fled in earns `panic_hold_bonus`.  Both
+        are in RAM units, where a maze row is 12.
+
+        The size of that cost matters far more than it looks, and the dose
+        response is not monotone.  At 6 the pooled result over 150 episodes
+        is 12626 against 11417 for the inherited behaviour (+1209, 2.4
+        combined SEM, and positive on all three seed blocks).  At 18 and
+        above it collapses to 8617 over 120 episodes: she commits so hard
+        to fleeing that she stops working the board, and levels cleared
+        fall from 1.3 to 0.6.  12 measured well on the seeds it was chosen
+        on and then failed to replicate on a fresh block (-280), which is
+        why the shipped value was confirmed on two further blocks.
+
+        Note what the gain is *not*: deaths are unchanged, 3.49 against
+        3.57.  What improves is throughput - levels 1.29 -> 1.57 and pills
+        7.7 against 6.6 a game - because the steps that used to be spent
+        vibrating between two squares are now spent covering ground.
+
+        `last_move` is deliberately left alone (see `panic_keep_last_move`,
+        default off): restoring it carries the fleeing direction into the
+        planner's hysteresis once planning recovers, which dragged her off
+        the board and cost about 2300 points a game.
+        """
+        assert self.maze is not None
+        if not self.panic_commit:
+            return super()._panic_move(here, ghost_dist)
+
+        backwards = (-self.direction[0], -self.direction[1])
+        best_key = best_move = best_cell = None
+        for r2, c2, _ in self.maze.neighbours(*here):
+            move = self._step_direction(here, (r2, c2))
+            room = int(ghost_dist[r2, c2])
+            if move == backwards:
+                room -= self.panic_reverse_cost
+            if move == self._panic_dir:
+                room += self.panic_hold_bonus
+            key = (room, self.maze.degree(r2, c2))
+            if best_key is None or key > best_key:
+                best_key, best_move, best_cell = key, move, (r2, c2)
+        if best_cell is None:
+            return policy.ACTION_NOOP
+        self._panic_dir = best_move
+        if self.panic_keep_last_move:
+            self.last_move = best_move
+        return self._action_towards(here, best_cell)
 
 
 # ---------------------------------------------------------------------------
